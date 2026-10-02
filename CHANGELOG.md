@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- Added `fs.manifest` with `build_manifest` and `diff_manifests`, to
+  generate content-based directory listings (path, size, streaming
+  digest; directories and symlinks recorded separately) and compare
+  them for added, removed, changed, and type-conflicting entries.
+  Entries that change while being scanned are flagged as unstable.
+
 - Added `filter_glob` and `exclude_glob` parameters to `fs.walk.Walker`.
   Closes [#459](https://github.com/PyFilesystem/pyfilesystem2/issues/459).
 

@@ -12,6 +12,7 @@ Reference
    reference/glob.rst
    reference/info_objects.rst
    reference/filesize.rst
+   reference/manifest.rst
    reference/mirror.rst
    reference/move.rst
    reference/mode.rst
