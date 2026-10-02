@@ -8,6 +8,7 @@ import typing
 
 import six
 import zipfile
+from collections import OrderedDict
 from datetime import datetime
 
 from . import errors
@@ -17,9 +18,8 @@ from .compress import write_zip
 from .enums import ResourceType, Seek
 from .info import Info
 from .iotools import RawWrapper
-from .memoryfs import MemoryFS
 from .opener import open_fs
-from .path import dirname, forcedir, normpath, relpath
+from .path import basename, relpath
 from .permissions import Permissions
 from .time import datetime_to_epoch
 from .wrapfs import WrapFS
@@ -45,12 +45,15 @@ if typing.TYPE_CHECKING:
 
 
 class _ZipExtFile(RawWrapper):
-    def __init__(self, fs, name):  # noqa: D107
-        # type: (ReadZipFS, Text) -> None
+    def __init__(self, fs, member):  # noqa: D107
+        # type: (ReadZipFS, ZipMember) -> None
         self._zip = _zip = fs._zip
-        self._end = _zip.getinfo(name).file_size
+        self._zip_info = member.zip_info
+        self._end = member.file_size
         self._pos = 0
-        super(_ZipExtFile, self).__init__(_zip.open(name), "r", name)
+        super(_ZipExtFile, self).__init__(
+            _zip.open(self._zip_info), "r", member.raw_name
+        )
 
     # NOTE(@althonos): Starting from Python 3.7, files inside a Zip archive are
     #                  seekable provided they were opened from a seekable file
@@ -126,7 +129,7 @@ class _ZipExtFile(RawWrapper):
                 )
 
             if offset < self._pos:
-                self._f = self._zip.open(self.name)  # type: ignore
+                self._f = self._zip.open(self._zip_info)  # type: ignore
                 self._pos = 0
             self.read(offset - self._pos)
             return self._pos
@@ -175,6 +178,122 @@ class _ZipExtFile(RawWrapper):
                 )
 
             return self._f.seek(offset, _whence)
+
+
+class ZipMember(object):
+    """A member of the central directory of a zip archive.
+
+    The ``index`` of a member is its position in the central directory.
+    Unlike the member name, it remains unambiguous when an archive contains
+    duplicates or paths that normalize to the same location.
+    """
+
+    __slots__ = ("index", "raw_name", "path", "is_dir", "issue", "zip_info")
+
+    def __init__(
+        self,
+        index,  # type: int
+        raw_name,  # type: Text
+        path,  # type: Optional[Text]
+        is_dir,  # type: bool
+        zip_info,  # type: zipfile.ZipInfo
+        issue=None,  # type: Optional[Text]
+    ):
+        # type: (...) -> None
+        self.index = index
+        self.raw_name = raw_name
+        self.path = path
+        self.is_dir = is_dir
+        self.issue = issue
+        self.zip_info = zip_info
+
+    def __repr__(self):
+        # type: () -> Text
+        return "ZipMember(index={!r}, name={!r})".format(self.index, self.raw_name)
+
+    def __eq__(self, other):
+        # type: (object) -> bool
+        return isinstance(other, ZipMember) and self.index == other.index
+
+    def __ne__(self, other):
+        # type: (object) -> bool
+        return not self == other
+
+    def __hash__(self):
+        # type: () -> int
+        return hash(("ZipMember", self.index))
+
+    @property
+    def name(self):
+        # type: () -> Text
+        """The member name stored in the central directory."""
+        return self.raw_name
+
+    @property
+    def file_name(self):
+        # type: () -> Text
+        """The member name stored in the central directory."""
+        return self.raw_name
+
+    @property
+    def filename(self):
+        # type: () -> Text
+        """The member name stored in the central directory."""
+        return self.raw_name
+
+    @property
+    def size(self):
+        # type: () -> int
+        """The uncompressed size of the member."""
+        return self.zip_info.file_size
+
+    @property
+    def file_size(self):
+        # type: () -> int
+        """The uncompressed size of the member."""
+        return self.zip_info.file_size
+
+    @property
+    def id(self):
+        # type: () -> int
+        """The central-directory index of this member."""
+        return self.index
+
+    @property
+    def entry_id(self):
+        # type: () -> int
+        """The central-directory index of this member."""
+        return self.index
+
+    @property
+    def crc(self):
+        # type: () -> int
+        """The CRC-32 checksum of the uncompressed data."""
+        return self.zip_info.CRC
+
+    @property
+    def CRC(self):
+        # type: () -> int
+        """The CRC-32 checksum of the uncompressed data."""
+        return self.zip_info.CRC
+
+    @property
+    def compress_type(self):
+        # type: () -> int
+        """The compression method used by this member."""
+        return self.zip_info.compress_type
+
+    @property
+    def compress_size(self):
+        # type: () -> int
+        """The compressed size of the member."""
+        return self.zip_info.compress_size
+
+    @property
+    def date_time(self):
+        # type: () -> Tuple[int, int, int, int, int, int]
+        """The modification timestamp stored by the member."""
+        return self.zip_info.date_time
 
 
 class ZipFS(WrapFS):
@@ -351,7 +470,12 @@ class ReadZipFS(FS):
         self._file = file
         self.encoding = encoding
         self._zip = zipfile.ZipFile(file, "r")
-        self._directory_fs = None  # type: Optional[MemoryFS]
+        self._members = []  # type: List[ZipMember]
+        self._path_members = OrderedDict()  # type: Dict[Text, List[ZipMember]]
+        self._directory_paths = set()  # type: set
+        self._ambiguous_paths = set()  # type: set
+        self._directory_entries = OrderedDict()  # type: Dict[Text, Optional[ZipMember]]
+        self._load_members()
 
     def __repr__(self):
         # type: () -> Text
@@ -361,34 +485,175 @@ class ReadZipFS(FS):
         # type: () -> Text
         return "<zipfs '{}'>".format(self._file)
 
-    def _path_to_zip_name(self, path):
-        # type: (Text) -> str
-        """Convert a path to a zip file name."""
-        path = relpath(normpath(path))
-        if self._directory.isdir(path):
-            path = forcedir(path)
+    def _decode_name(self, zip_info):
+        # type: (zipfile.ZipInfo) -> Text
         if six.PY2:
-            return path.encode(self.encoding)
-        return path
+            return zip_info.filename.decode(self.encoding, "replace")
+        return zip_info.filename
 
-    @property
-    def _directory(self):
-        # type: () -> MemoryFS
-        """`MemoryFS`: a filesystem with the same folder hierarchy as the zip."""
+    @staticmethod
+    def _normalize_member_name(raw_name):
+        # type: (Text) -> Tuple[Optional[Text], Optional[Text]]
+        is_dir = raw_name.endswith("/")
+        name = raw_name[:-1] if is_dir else raw_name
+        issues = []  # type: List[Text]
+        if name.startswith("/"):
+            issues.append("absolute path treated as archive-relative")
+            name = name.lstrip("/")
+
+        components = []  # type: List[Text]
+        for component in name.split("/"):
+            if component == "":
+                continue
+            if component == ".":
+                continue
+            if component == "..":
+                if components:
+                    components.pop()
+                else:
+                    issues.append("parent directory reference removed from root")
+            else:
+                components.append(component)
+
+        if not components:
+            if is_dir:
+                return "", "; ".join(issues) if issues else None
+            return None, "invalid empty file name"
+        return "/".join(components), "; ".join(issues) if issues else None
+
+    def _load_members(self):
+        # type: () -> None
+        for index, zip_info in enumerate(self._zip.infolist()):
+            raw_name = self._decode_name(zip_info)
+            path, issue = self._normalize_member_name(raw_name)
+            member = ZipMember(
+                index,
+                raw_name,
+                path,
+                raw_name.endswith("/"),
+                zip_info,
+                issue,
+            )
+            self._members.append(member)
+            if path is not None:
+                self._path_members.setdefault(path, []).append(member)
+
+        for members in self._path_members.values():
+            for member in members:
+                parent = member.path
+                while parent:
+                    parent = parent.rsplit("/", 1)[0] if "/" in parent else ""
+                    self._directory_paths.add(parent)
+
+        all_paths = set(self._path_members)
+        all_paths.update(self._directory_paths)
+        for path in all_paths:
+            members = self._path_members.get(path, [])
+            file_members = [member for member in members if not member.is_dir]
+            directory_members = [member for member in members if member.is_dir]
+            is_explicit_directory = bool(directory_members)
+            is_implicit_directory = path in self._directory_paths
+            is_ambiguous = (
+                len(file_members) > 1
+                or len(directory_members) > 1
+                or bool(
+                    file_members and (is_explicit_directory or is_implicit_directory)
+                )
+                or bool(is_implicit_directory and len(directory_members) > 1)
+            )
+
+            if path and is_ambiguous:
+                self._ambiguous_paths.add(path)
+                collision = "normalized path collision with entries: {}".format(
+                    ", ".join(str(member.index) for member in members)
+                )
+                for member in members:
+                    member.issue = (
+                        "; ".join((member.issue, collision))
+                        if member.issue
+                        else collision
+                    )
+            elif directory_members:
+                self._directory_entries[path] = directory_members[0]
+            else:
+                self._directory_entries[path] = None
+
+    def members(self):
+        # type: () -> List[ZipMember]
+        """Return all central-directory members in archive order."""
         self.check()
-        with self._lock:
-            if self._directory_fs is None:
-                self._directory_fs = _fs = MemoryFS()
-                for zip_name in self._zip.namelist():
-                    resource_name = zip_name
-                    if six.PY2:
-                        resource_name = resource_name.decode(self.encoding, "replace")
-                    if resource_name.endswith("/"):
-                        _fs.makedirs(resource_name, recreate=True)
-                    else:
-                        _fs.makedirs(dirname(resource_name), recreate=True)
-                        _fs.create(resource_name)
-            return self._directory_fs
+        return list(self._members)
+
+    getmembers = members
+    list_members = members
+
+    def getmember(self, member):
+        # type: (Union[int, ZipMember, zipfile.ZipInfo]) -> ZipMember
+        """Get a member by central-directory index or concrete entry identity."""
+        self.check()
+        if isinstance(member, ZipMember):
+            index = member.index
+            if index < 0 or index >= len(self._members):
+                raise errors.ResourceNotFound("zip member {}".format(index))
+            if self._members[index].zip_info is not member.zip_info:
+                raise errors.ResourceNotFound("zip member {}".format(index))
+            return self._members[index]
+        elif isinstance(member, zipfile.ZipInfo):
+            for zip_member in self._members:
+                if zip_member.zip_info is member:
+                    return zip_member
+            raise errors.ResourceNotFound("zip member {!r}".format(member.filename))
+        elif isinstance(member, int) and not isinstance(member, bool):
+            index = member
+            if index < 0:
+                raise errors.ResourceNotFound("zip member {}".format(index))
+        else:
+            raise TypeError("member must be a ZipMember or central-directory index")
+        try:
+            return self._members[index]
+        except IndexError:
+            raise errors.ResourceNotFound("zip member {}".format(index))
+
+    def openmember(self, member, mode="r", buffering=-1, **options):
+        # type: (Union[int, ZipMember, zipfile.ZipInfo], Text, int, **Any) -> BinaryIO
+        """Open a file member by its central-directory identity."""
+        self.check()
+        if "w" in mode or "+" in mode or "a" in mode:
+            resource_name = (
+                member.raw_name if isinstance(member, ZipMember) else repr(member)
+            )
+            raise errors.ResourceReadOnly(resource_name)
+        zip_member = self.getmember(member)
+        if zip_member.is_dir:
+            raise errors.FileExpected(zip_member.raw_name)
+        return _ZipExtFile(self, zip_member)
+
+    openbin_member = openmember
+
+    def readmember(self, member):
+        # type: (Union[int, ZipMember, zipfile.ZipInfo]) -> bytes
+        """Read a file member by its central-directory identity."""
+        self.check()
+        zip_member = self.getmember(member)
+        if zip_member.is_dir:
+            raise errors.FileExpected(zip_member.raw_name)
+        return self._zip.read(zip_member.zip_info)
+
+    readbytes_member = readmember
+
+    def _get_path_member(self, path):
+        # type: (Text) -> Union[ZipMember, bool, None]
+        if path in self._ambiguous_paths:
+            indexes = [str(member.index) for member in self._path_members[path]]
+            message = (
+                "path '{path}' matches multiple central-directory entries: "
+                + ", ".join(indexes)
+            )
+            raise errors.ResourceInvalid(path, msg=message)
+        members = self._path_members.get(path)
+        if members:
+            return members[0]
+        return self._directory_entries.get(path, False)  # type: ignore
 
     def getinfo(self, path, namespaces=None):
         # type: (Text, Optional[Collection[Text]]) -> Info
@@ -402,43 +667,44 @@ class ReadZipFS(FS):
                 raw_info["details"] = {"type": int(ResourceType.directory)}
 
         else:
-            basic_info = self._directory.getinfo(_path)
-            raw_info["basic"] = {"name": basic_info.name, "is_dir": basic_info.is_dir}
+            resource_path = relpath(_path)
+            zip_member = self._get_path_member(resource_path)
+            if zip_member is False:
+                raise errors.ResourceNotFound(path)
+            is_dir = zip_member is None or zip_member.is_dir
+            raw_info["basic"] = {
+                "name": basename(resource_path),
+                "is_dir": is_dir,
+            }
 
-            if not {"details", "access", "zip"}.isdisjoint(namespaces):
-                zip_name = self._path_to_zip_name(path)
-                try:
-                    zip_info = self._zip.getinfo(zip_name)
-                except KeyError:
-                    # Can occur if there is an implied directory in the zip
-                    pass
-                else:
-                    if "details" in namespaces:
-                        raw_info["details"] = {
-                            "size": zip_info.file_size,
-                            "type": int(
-                                ResourceType.directory
-                                if basic_info.is_dir
-                                else ResourceType.file
-                            ),
-                            "modified": datetime_to_epoch(
-                                datetime(*zip_info.date_time)
-                            ),
+            if zip_member is not None:
+                zip_info = zip_member.zip_info
+                if "details" in namespaces:
+                    raw_info["details"] = {
+                        "size": zip_info.file_size,
+                        "type": int(
+                            ResourceType.directory
+                            if is_dir
+                            else ResourceType.file
+                        ),
+                        "modified": datetime_to_epoch(datetime(*zip_info.date_time)),
+                    }
+                if "zip" in namespaces:
+                    raw_info["zip"] = {
+                        k: getattr(zip_info, k)
+                        for k in zip_info.__slots__  # type: ignore
+                        if not k.startswith("_")
+                    }
+                if "access" in namespaces:
+                    # check the zip was created on UNIX to get permissions
+                    if zip_info.external_attr and zip_info.create_system == 3:
+                        raw_info["access"] = {
+                            "permissions": Permissions(
+                                mode=zip_info.external_attr >> 16 & 0xFFF
+                            ).dump()
                         }
-                    if "zip" in namespaces:
-                        raw_info["zip"] = {
-                            k: getattr(zip_info, k)
-                            for k in zip_info.__slots__  # type: ignore
-                            if not k.startswith("_")
-                        }
-                    if "access" in namespaces:
-                        # check the zip was created on UNIX to get permissions
-                        if zip_info.external_attr and zip_info.create_system == 3:
-                            raw_info["access"] = {
-                                "permissions": Permissions(
-                                    mode=zip_info.external_attr >> 16 & 0xFFF
-                                ).dump()
-                            }
+            elif "details" in namespaces:
+                raw_info["details"] = {"type": int(ResourceType.directory)}
 
         return Info(raw_info)
 
@@ -449,8 +715,22 @@ class ReadZipFS(FS):
 
     def listdir(self, path):
         # type: (Text) -> List[Text]
-        self.check()
-        return self._directory.listdir(path)
+        _path = relpath(self.validatepath(path))
+        zip_member = self._get_path_member(_path)
+        if zip_member is not False and zip_member is not None and not zip_member.is_dir:
+            raise errors.DirectoryExpected(path)
+        if zip_member is False:
+            raise errors.ResourceNotFound(path)
+
+        prefix = "" if not _path else _path + "/"
+        children = OrderedDict()  # type: Dict[Text, None]
+        for member in self._members:
+            child = member.path
+            if child is not None and child.startswith(prefix):
+                name = child[len(prefix):].split("/", 1)[0]
+                if name:
+                    children[name] = None
+        return list(children.keys())
 
     def makedir(
         self,  # type: R
@@ -468,13 +748,14 @@ class ReadZipFS(FS):
         if "w" in mode or "+" in mode or "a" in mode:
             raise errors.ResourceReadOnly(path)
 
-        if not self._directory.exists(path):
+        _path = relpath(self.validatepath(path))
+        zip_member = self._get_path_member(_path)
+        if zip_member is False:
             raise errors.ResourceNotFound(path)
-        elif self._directory.isdir(path):
+        elif zip_member is None or zip_member.is_dir:
             raise errors.FileExpected(path)
 
-        zip_name = self._path_to_zip_name(path)
-        return _ZipExtFile(self, zip_name)  # type: ignore
+        return _ZipExtFile(self, zip_member)
 
     def remove(self, path):
         # type: (Text) -> None
@@ -495,11 +776,13 @@ class ReadZipFS(FS):
     def readbytes(self, path):
         # type: (Text) -> bytes
         self.check()
-        if not self._directory.isfile(path):
+        _path = relpath(self.validatepath(path))
+        zip_member = self._get_path_member(_path)
+        if zip_member is False or zip_member is None:
             raise errors.ResourceNotFound(path)
-        zip_name = self._path_to_zip_name(path)
-        zip_bytes = self._zip.read(zip_name)
-        return zip_bytes
+        if zip_member.is_dir:
+            raise errors.FileExpected(path)
+        return self._zip.read(zip_member.zip_info)
 
     def geturl(self, path, purpose="download"):
         # type: (Text, Text) -> Text

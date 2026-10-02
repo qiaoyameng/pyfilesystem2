@@ -7,12 +7,19 @@ import os
 import six
 import tempfile
 import unittest
+import warnings
 import zipfile
 
 from fs import zipfs
 from fs.compress import write_zip
 from fs.enums import Seek
-from fs.errors import NoURL
+from fs.errors import (
+    FileExpected,
+    IllegalBackReference,
+    NoURL,
+    ResourceInvalid,
+    ResourceNotFound,
+)
 from fs.opener import open_fs
 from fs.opener.errors import NotWriteable
 from fs.test import FSTestCases
@@ -218,6 +225,166 @@ class TestDirsZipFS(unittest.TestCase):
                 self.assertTrue(zip_fs.isfile("foo/bar/baz/egg"))
         finally:
             os.remove(path)
+
+
+class TestZipMembers(unittest.TestCase):
+    def setUp(self):
+        fh, self._temp_path = tempfile.mkstemp("testzip-members.zip")
+        os.close(fh)
+
+        duplicate_entries = [
+            ("dup", b"first", zipfile.ZIP_STORED),
+            ("dup", b"second", zipfile.ZIP_DEFLATED),
+            ("clash", b"file", zipfile.ZIP_STORED),
+            ("clash/", b"", zipfile.ZIP_STORED),
+            ("implicit", b"parent-file", zipfile.ZIP_STORED),
+            ("implicit/child", b"child", zipfile.ZIP_DEFLATED),
+            ("./normalized", b"dot", zipfile.ZIP_STORED),
+            ("normalized", b"plain", zipfile.ZIP_DEFLATED),
+            ("/etc/passwd", b"absolute", zipfile.ZIP_STORED),
+            ("etc/passwd", b"safe-absolute", zipfile.ZIP_DEFLATED),
+            ("../escape", b"escape", zipfile.ZIP_STORED),
+            ("escape", b"safe-escape", zipfile.ZIP_DEFLATED),
+        ]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with zipfile.ZipFile(self._temp_path, mode="w") as archive:
+                for name, data, compression in duplicate_entries:
+                    info = zipfile.ZipInfo(name)
+                    info.compress_type = compression
+                    archive.writestr(info, data)
+
+    def tearDown(self):
+        os.remove(self._temp_path)
+
+    def test_members_identify_central_directory_entries(self):
+        with zipfs.ReadZipFS(self._temp_path) as archive_fs:
+            members = archive_fs.getmembers()
+            self.assertEqual(len(members), 12)
+            self.assertEqual(
+                [(member.index, member.raw_name) for member in members],
+                [
+                    (0, "dup"),
+                    (1, "dup"),
+                    (2, "clash"),
+                    (3, "clash/"),
+                    (4, "implicit"),
+                    (5, "implicit/child"),
+                    (6, "./normalized"),
+                    (7, "normalized"),
+                    (8, "/etc/passwd"),
+                    (9, "etc/passwd"),
+                    (10, "../escape"),
+                    (11, "escape"),
+                ],
+            )
+
+            first = archive_fs.getmember(0)
+            second = archive_fs.getmember(1)
+            self.assertEqual(first.file_size, 5)
+            self.assertEqual(second.file_size, 6)
+            self.assertEqual(first.crc, first.zip_info.CRC)
+            self.assertEqual(second.crc, second.zip_info.CRC)
+            self.assertEqual(first.compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(second.compress_type, zipfile.ZIP_DEFLATED)
+            self.assertIn("entries: 0, 1", first.issue)
+            self.assertIn("entries: 0, 1", second.issue)
+            self.assertIn("entries: 6, 7", archive_fs.getmember(6).issue)
+
+            self.assertEqual(archive_fs.readmember(first), b"first")
+            self.assertEqual(archive_fs.readmember(1), b"second")
+            self.assertEqual(
+                archive_fs.readmember(second.zip_info), b"second"
+            )
+            with archive_fs.openmember(second) as member_file:
+                self.assertEqual(member_file.read(), b"second")
+
+            member_data = [
+                b"first",
+                b"second",
+                b"file",
+                None,
+                b"parent-file",
+                b"child",
+                b"dot",
+                b"plain",
+                b"absolute",
+                b"safe-absolute",
+                b"escape",
+                b"safe-escape",
+            ]
+            for index, data in enumerate(member_data):
+                if data is not None:
+                    self.assertEqual(archive_fs.readmember(index), data)
+
+            with self.assertRaises(ResourceNotFound):
+                archive_fs.getmember(-1)
+            with self.assertRaises(ResourceNotFound):
+                archive_fs.getmember(12)
+
+        with zipfs.ReadZipFS(self._temp_path) as archive_fs:
+            other = zipfs.ReadZipFS(self._temp_path)
+            try:
+                member = other.getmember(0)
+                with self.assertRaises(ResourceNotFound):
+                    archive_fs.getmember(member)
+            finally:
+                other.close()
+
+    def test_path_access_reports_collisions(self):
+        with zipfs.ReadZipFS(self._temp_path) as archive_fs:
+            for path in (
+                "dup",
+                "clash",
+                "implicit",
+                "normalized",
+                "etc/passwd",
+                "escape",
+            ):
+                with self.assertRaises(ResourceInvalid):
+                    archive_fs.getinfo(path)
+                with self.assertRaises(ResourceInvalid):
+                    archive_fs.openbin(path)
+
+            with self.assertRaises(IllegalBackReference):
+                archive_fs.openbin("../etc/passwd")
+
+    def test_unsafe_members_remain_available_by_identity(self):
+        with zipfs.ReadZipFS(self._temp_path) as archive_fs:
+            absolute = archive_fs.getmember(8)
+            parent = archive_fs.getmember(10)
+            self.assertEqual(absolute.path, "etc/passwd")
+            self.assertIn(
+                "absolute path treated as archive-relative", absolute.issue
+            )
+            self.assertIn("entries: 8, 9", absolute.issue)
+            self.assertEqual(parent.path, "escape")
+            self.assertIn(
+                "parent directory reference removed from root", parent.issue
+            )
+            self.assertIn("entries: 10, 11", parent.issue)
+            self.assertEqual(archive_fs.readmember(absolute), b"absolute")
+            self.assertEqual(archive_fs.readmember(parent), b"escape")
+
+            directory = archive_fs.getmember(3)
+            with self.assertRaises(FileExpected):
+                archive_fs.openmember(directory)
+
+    def test_member_identity_is_stable_after_reopen(self):
+        with zipfs.ReadZipFS(self._temp_path) as archive_fs:
+            first = archive_fs.getmember(0)
+            second = archive_fs.getmember(1)
+            first_bytes = archive_fs.readmember(first)
+            second_bytes = archive_fs.readmember(second)
+
+        with zipfs.ReadZipFS(self._temp_path) as archive_fs:
+            reopened_first = archive_fs.getmember(0)
+            reopened_second = archive_fs.getmember(1)
+            self.assertEqual(first, reopened_first)
+            self.assertEqual(second, reopened_second)
+            self.assertEqual(archive_fs.readmember(reopened_first), first_bytes)
+            self.assertEqual(archive_fs.readmember(reopened_second), second_bytes)
 
 
 class TestOpener(unittest.TestCase):
