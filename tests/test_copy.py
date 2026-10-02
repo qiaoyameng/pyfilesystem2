@@ -3,6 +3,8 @@ from __future__ import unicode_literals
 import calendar
 import datetime
 import errno
+import hashlib
+import io
 import os
 import shutil
 import tempfile
@@ -11,6 +13,83 @@ from parameterized import parameterized
 
 import fs.copy
 from fs import open_fs
+from fs.errors import CopyCancelled, IllegalDestination, Unsupported
+from fs.memoryfs import MemoryFS
+
+
+class ShortReader(io.RawIOBase):
+    def __init__(self, stream, limit):
+        self._stream = stream
+        self._limit = limit
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self._limit
+        return self._stream.read(min(size, self._limit))
+
+
+class ShortWriter(io.RawIOBase):
+    def __init__(self, stream, limit):
+        self._stream = stream
+        self._limit = limit
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        count = min(len(data), self._limit)
+        self._stream.write(data[:count])
+        return count
+
+
+class ShortIOFS(MemoryFS):
+    short_io = False
+
+    def openbin(self, path, mode="r", buffering=-1, **options):
+        stream = super(ShortIOFS, self).openbin(
+            path, mode=mode, buffering=0, **options
+        )
+        if not self.short_io:
+            return stream
+        if "r" in mode:
+            return ShortReader(stream, 7)
+        return ShortWriter(stream, 5)
+
+
+class NonAtomicFS(MemoryFS):
+    _meta = dict(MemoryFS._meta)
+
+    def __init__(self):
+        super(NonAtomicFS, self).__init__()
+        self._meta["supports_atomic_replace"] = False
+
+    def replace(self, src_path, dst_path):
+        raise Unsupported(dst_path)
+
+
+class UnknownCapabilityFS(NonAtomicFS):
+    def __init__(self):
+        super(UnknownCapabilityFS, self).__init__()
+        self._meta.pop("supports_atomic_replace")
+
+
+class FallbackPublishFailureFS(NonAtomicFS):
+    def __init__(self, fail_move_to):
+        super(FallbackPublishFailureFS, self).__init__()
+        self.fail_move_to = fail_move_to
+
+    def move(self, src_path, dst_path, overwrite=False, preserve_time=False):
+        if dst_path == self.fail_move_to and src_path.startswith("/.target.tmp."):
+            raise RuntimeError("publish failed")
+        return super(FallbackPublishFailureFS, self).move(
+            src_path,
+            dst_path,
+            overwrite=overwrite,
+            preserve_time=preserve_time,
+        )
 
 
 def _create_sandbox_dir(prefix="pyfilesystem2_sandbox_", home=None):
@@ -62,6 +141,145 @@ def mkdirp(path):
 
 
 class TestCopySimple(unittest.TestCase):
+    def test_copy_file_atomic_cancel_preserves_existing_destination(self):
+        data = b"0123456789" * 10
+        src_fs = ShortIOFS()
+        dst_fs = ShortIOFS()
+        src_fs.writebytes("source", data)
+        dst_fs.writebytes("target", b"old contents")
+        src_fs.short_io = True
+        dst_fs.short_io = True
+        progress = []
+
+        def on_progress(bytes_written, total_size, *args):
+            progress.append(bytes_written)
+            self.assertEqual(total_size, len(data))
+            return bytes_written < 25
+
+        try:
+            with self.assertRaises(CopyCancelled):
+                fs.copy.copy_file_atomic(
+                    src_fs,
+                    "source",
+                    dst_fs,
+                    "target",
+                    on_progress=on_progress,
+                    chunk_size=16,
+                )
+        finally:
+            src_fs.short_io = False
+            dst_fs.short_io = False
+
+        self.assertEqual(dst_fs.readbytes("target"), b"old contents")
+        self.assertEqual(dst_fs.listdir("/"), ["target"])
+        self.assertEqual(progress[0], 0)
+        self.assertTrue(
+            all(
+                progress[i] < progress[i + 1]
+                for i in range(len(progress) - 1)
+            )
+        )
+        self.assertEqual(progress[-1], 26)
+
+    def test_copy_file_atomic_completes_with_short_reads_and_writes(self):
+        data = b"abcdefghij" * 13
+        src_fs = ShortIOFS()
+        dst_fs = ShortIOFS()
+        src_fs.writebytes("source", data)
+        dst_fs.makedir("nested")
+        src_fs.short_io = True
+        dst_fs.short_io = True
+        progress = []
+
+        try:
+            result = fs.copy.copy_file_atomic(
+                src_fs,
+                "source",
+                dst_fs,
+                "nested/target",
+                on_progress=lambda written, total_size, *args: progress.append(
+                    written
+                ),
+                chunk_size=16,
+            )
+        finally:
+            src_fs.short_io = False
+            dst_fs.short_io = False
+
+        self.assertEqual(dst_fs.readbytes("nested/target"), data)
+        self.assertEqual(dst_fs.listdir("nested"), ["target"])
+        self.assertEqual(result["bytes_written"], len(data))
+        self.assertEqual(result["size"], len(data))
+        self.assertEqual(
+            result["hash"], hashlib.sha256(data).hexdigest()
+        )
+        self.assertEqual(progress[0], 0)
+        self.assertEqual(progress[-1], len(data))
+
+    def test_copy_file_atomic_rejects_same_path(self):
+        filesystem = ShortIOFS()
+        filesystem.writebytes("file", b"data")
+        with self.assertRaises(IllegalDestination):
+            fs.copy.copy_file_atomic(filesystem, "file", filesystem, "file")
+
+    def test_copy_file_atomic_non_atomic_fallback(self):
+        src_fs = NonAtomicFS()
+        dst_fs = NonAtomicFS()
+        src_fs.writebytes("source", b"new")
+        dst_fs.writebytes("target", b"old")
+
+        with self.assertRaises(Unsupported):
+            fs.copy.copy_file_atomic(src_fs, "source", dst_fs, "target")
+        self.assertEqual(dst_fs.readbytes("target"), b"old")
+
+        unknown_dst = UnknownCapabilityFS()
+        unknown_dst.writebytes("target", b"old")
+        with self.assertRaises(Unsupported):
+            fs.copy.copy_file_atomic(src_fs, "source", unknown_dst, "target")
+        self.assertEqual(unknown_dst.readbytes("target"), b"old")
+
+        result = fs.copy.copy_file_atomic(
+            src_fs, "source", dst_fs, "target", allow_non_atomic=True
+        )
+        self.assertEqual(dst_fs.readbytes("target"), b"new")
+        self.assertEqual(dst_fs.listdir("/"), ["target"])
+        self.assertEqual(result["hash"], hashlib.sha256(b"new").hexdigest())
+
+    def test_copy_file_atomic_callback_exception_cleans_temporary_file(self):
+        src_fs = MemoryFS()
+        dst_fs = MemoryFS()
+        src_fs.writebytes("source", b"data")
+
+        def on_progress(bytes_written, *args):
+            if bytes_written:
+                raise RuntimeError("callback failed")
+            return True
+
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            fs.copy.copy_file_atomic(
+                src_fs, "source", dst_fs, "target", on_progress=on_progress
+            )
+
+        self.assertEqual(dst_fs.listdir("/"), [])
+
+    def test_copy_file_atomic_fallback_publish_failure_restores_target(self):
+        src_fs = FallbackPublishFailureFS("/target")
+        dst_fs = src_fs
+        src_fs.writebytes("source", b"new")
+        src_fs.writebytes("target", b"old")
+
+        with self.assertRaisesRegex(RuntimeError, "publish failed"):
+            fs.copy.copy_file_atomic(
+                src_fs,
+                "source",
+                dst_fs,
+                "target",
+                allow_non_atomic=True,
+            )
+
+        self.assertEqual(dst_fs.readbytes("target"), b"old")
+        self.assertEqual(sorted(dst_fs.listdir("/")), ["source", "target"])
+
     @parameterized.expand([(0,), (1,), (2,), (4,)])
     def test_copy_fs(self, workers):
         namespaces = ("details", "modified")

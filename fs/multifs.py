@@ -50,7 +50,12 @@ class MultiFS(FS):
 
     """
 
-    _meta = {"virtual": True, "read_only": False, "case_insensitive": False}
+    _meta = {
+        "virtual": True,
+        "read_only": False,
+        "case_insensitive": False,
+        "supports_atomic_replace": False,
+    }
 
     def __init__(self, auto_close=True):
         # type: (bool) -> None

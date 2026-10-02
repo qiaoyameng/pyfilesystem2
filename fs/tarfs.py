@@ -241,6 +241,7 @@ class ReadTarFS(FS):
         "case_insensitive": True,
         "network": False,
         "read_only": True,
+        "supports_atomic_replace": False,
         "supports_rename": False,
         "thread_safe": True,
         "unicode_paths": True,

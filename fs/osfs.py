@@ -77,6 +77,24 @@ log = logging.getLogger("fs.osfs")
 _WINDOWS_PLATFORM = platform.system() == "Windows"
 
 
+def _replace_file(src_path, dst_path):
+    if hasattr(os, "replace"):
+        os.replace(src_path, dst_path)
+    elif _WINDOWS_PLATFORM:  # pragma: no cover
+        import ctypes
+
+        move_file_ex = ctypes.windll.kernel32.MoveFileExW
+        move_file_ex.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        move_file_ex.restype = ctypes.c_int
+        move_file_replace_existing = 0x1
+        if not move_file_ex(
+            fsdecode(src_path), fsdecode(dst_path), move_file_replace_existing
+        ):
+            raise ctypes.WinError()
+    else:
+        os.rename(src_path, dst_path)
+
+
 @six.python_2_unicode_compatible
 class OSFS(FS):
     """Create an OSFS.
@@ -144,6 +162,7 @@ class OSFS(FS):
             "network": False,
             "read_only": False,
             "supports_rename": True,
+            "supports_atomic_replace": True,
             "thread_safe": True,
             "unicode_paths": os.path.supports_unicode_filenames,
             "virtual": False,
@@ -376,6 +395,16 @@ class OSFS(FS):
                     if os.path.isdir(sys_path):  # pragma: no cover
                         raise errors.FileExpected(path)
                 raise
+
+    def replace(self, src_path, dst_path):
+        # type: (Text, Text) -> None
+        self.check()
+        _src_path = self.validatepath(src_path)
+        _dst_path = self.validatepath(dst_path)
+        src_sys_path = self._to_sys_path(_src_path)
+        dst_sys_path = self._to_sys_path(_dst_path)
+        with convert_os_errors("replace", dst_path):
+            _replace_file(src_sys_path, dst_sys_path)
 
     def removedir(self, path):
         # type: (Text) -> None

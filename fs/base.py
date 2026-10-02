@@ -761,6 +761,9 @@ class FS(object):
         read_only           `True` if this filesystem is read only.
         supports_rename     `True` if this filesystem supports an
                             `os.rename` operation.
+        supports_atomic_replace
+                            `True` if this filesystem can replace an
+                            existing file atomically.
         =================== ============================================
 
         Most builtin filesystems will provide all these keys, and third-
@@ -1105,6 +1108,23 @@ class FS(object):
             if not create and not self.exists(dst_path):
                 raise errors.ResourceNotFound(dst_path)
             move_dir(self, src_path, self, dst_path, preserve_time=preserve_time)
+
+    def replace(self, src_path, dst_path):
+        # type: (Text, Text) -> None
+        """Atomically replace a file with another file.
+
+        Arguments:
+            src_path (str): Path of the replacement file.
+            dst_path (str): Path of the file to replace.
+
+        Raises:
+            fs.errors.Unsupported: If this filesystem cannot atomically
+                replace an existing file.
+            fs.errors.FileExpected: If either path maps to a directory.
+            fs.errors.ResourceNotFound: If either path does not exist.
+
+        """
+        raise errors.Unsupported(path=dst_path)
 
     def makedirs(
         self,

@@ -22,6 +22,7 @@ if typing.TYPE_CHECKING:
 
 __all__ = [
     "BulkCopyFailed",
+    "CopyCancelled",
     "CreateFailed",
     "DestinationExists",
     "DirectoryExists",
@@ -233,6 +234,12 @@ class OperationTimeout(OperationFailed):
     """Filesystem took too long."""
 
     default_message = "operation timed out"
+
+
+class CopyCancelled(OperationFailed):
+    """A copy operation was cancelled by its progress callback."""
+
+    default_message = "copy operation cancelled"
 
 
 class RemoveRootError(OperationFailed):

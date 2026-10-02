@@ -206,6 +206,11 @@ class WrapReadOnly(WrapFS[_F], typing.Generic[_F]):
         self.check()
         raise ResourceReadOnly(dst_path)
 
+    def replace(self, src_path, dst_path):
+        # type: (Text, Text) -> None
+        self.check()
+        raise ResourceReadOnly(dst_path)
+
     def openbin(self, path, mode="r", buffering=-1, **options):
         # type: (Text, Text, int, **Any) -> BinaryIO
         self.check()
@@ -327,5 +332,9 @@ class WrapReadOnly(WrapFS[_F], typing.Generic[_F]):
         # type: (Text) -> Mapping[Text, object]
         self.check()
         meta = dict(self.delegate_fs().getmeta(namespace=namespace))
-        meta.update(read_only=True, supports_rename=False)
+        meta.update(
+            read_only=True,
+            supports_rename=False,
+            supports_atomic_replace=False,
+        )
         return meta

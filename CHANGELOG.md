@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 - Added `filter_glob` and `exclude_glob` parameters to `fs.walk.Walker`.
   Closes [#459](https://github.com/PyFilesystem/pyfilesystem2/issues/459).
+- Added `fs.copy.copy_file_atomic` for cancellable, progress-reporting copies
+  that write and verify a destination-side temporary file before replacing the
+  target. Filesystems advertise this with the `supports_atomic_replace` meta
+  key and implement `FS.replace`.
+- Added `fs.errors.CopyCancelled` for copies cancelled by their progress
+  callback.
 
 ### Fixed
 - Elaborated documentation of `filter_dirs` and `exclude_dirs` in `fs.walk.Walker`.

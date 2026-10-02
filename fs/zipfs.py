@@ -338,6 +338,7 @@ class ReadZipFS(FS):
         "case_insensitive": False,
         "network": False,
         "read_only": True,
+        "supports_atomic_replace": False,
         "supports_rename": False,
         "thread_safe": True,
         "unicode_paths": True,

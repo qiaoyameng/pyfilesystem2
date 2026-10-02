@@ -201,6 +201,15 @@ class WrapFS(FS, typing.Generic[_F]):
         with unwrap_errors(path):
             _fs.remove(_path)
 
+    def replace(self, src_path, dst_path):
+        # type: (Text, Text) -> None
+        src_fs, _src_path = self.delegate_path(src_path)
+        dst_fs, _dst_path = self.delegate_path(dst_path)
+        if src_fs is not dst_fs:
+            raise errors.Unsupported(path=dst_path)
+        with unwrap_errors({_src_path: src_path, _dst_path: dst_path}):
+            src_fs.replace(_src_path, _dst_path)
+
     def removedir(self, path):
         # type: (Text) -> None
         self.check()

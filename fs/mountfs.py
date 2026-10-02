@@ -49,6 +49,7 @@ class MountFS(FS):
         "unicode_paths": True,
         "case_insensitive": False,
         "invalid_path_chars": "\0",
+        "supports_atomic_replace": False,
     }
 
     def __init__(self, auto_close=True):

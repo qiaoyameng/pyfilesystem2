@@ -342,6 +342,7 @@ class MemoryFS(FS):
         "invalid_path_chars": "\0",
         "network": False,
         "read_only": False,
+        "supports_atomic_replace": True,
         "thread_safe": True,
         "unicode_paths": True,
         "virtual": False,
@@ -476,6 +477,31 @@ class MemoryFS(FS):
 
             if preserve_time:
                 copy_modified_time(self, src_path, self, dst_path)
+
+    def replace(self, src_path, dst_path):
+        src_dir, src_name = split(self.validatepath(src_path))
+        dst_dir, dst_name = split(self.validatepath(dst_path))
+
+        with self._lock:
+            src_dir_entry = self._get_dir_entry(src_dir)
+            if src_dir_entry is None or src_name not in src_dir_entry:
+                raise errors.ResourceNotFound(src_path)
+            src_entry = src_dir_entry.get_entry(src_name)
+            if src_entry.is_dir:
+                raise errors.FileExpected(src_path)
+
+            dst_dir_entry = self._get_dir_entry(dst_dir)
+            if dst_dir_entry is None or dst_name not in dst_dir_entry:
+                raise errors.ResourceNotFound(dst_path)
+            if dst_dir_entry.get_entry(dst_name).is_dir:
+                raise errors.FileExpected(dst_path)
+
+            if src_dir == dst_dir and src_name == dst_name:
+                return
+
+            dst_dir_entry.set_entry(dst_name, src_entry)
+            src_dir_entry.remove_entry(src_name)
+            src_entry.name = dst_name
 
     def movedir(self, src_path, dst_path, create=False, preserve_time=False):
         _src_path = self.validatepath(src_path)

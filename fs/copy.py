@@ -5,20 +5,110 @@ from __future__ import print_function, unicode_literals
 
 import typing
 
+import binascii
+import hashlib
+import os
 import warnings
 
-from .errors import IllegalDestination, ResourceNotFound
+from .errors import (
+    CopyCancelled,
+    FileExpected,
+    IllegalDestination,
+    ResourceInvalid,
+    ResourceNotFound,
+    Unsupported,
+    UnsupportedHash,
+)
 from .opener import manage_fs
-from .path import abspath, combine, frombase, isbase, normpath
+from .path import abspath, basename, combine, dirname, frombase, isbase, normpath
 from .tools import is_thread_safe
 from .walk import Walker
 
 if typing.TYPE_CHECKING:
-    from typing import Callable, Optional, Text, Union
+    from typing import Any, Callable, Dict, Optional, Set, Text, Union
 
     from .base import FS
 
     _OnCopy = Callable[[FS, Text, FS, Text], object]
+    _OnProgress = Callable[[int, Optional[int], FS, Text, FS, Text], object]
+
+
+_COPY_CHUNK_SIZE = 64 * 1024
+
+
+def _hash_file(fs, path, algorithm):
+    # type: (FS, Text, Text) -> Text
+    hash_object = hashlib.new(algorithm)
+    with fs.openbin(path) as read_file:
+        while True:
+            chunk = read_file.read(1024 * 1024)
+            if not chunk:
+                break
+            hash_object.update(chunk)
+    return hash_object.hexdigest()
+
+
+def _report_progress(
+    on_progress, bytes_written, total_size, src_fs, src_path, dst_fs, dst_path
+):
+    # type: (...) -> None
+    if on_progress is not None and on_progress(
+        bytes_written, total_size, src_fs, src_path, dst_fs, dst_path
+    ) is False:
+        raise CopyCancelled(dst_path)
+
+
+def _write_all(
+    write_file,
+    chunk,
+    on_progress,
+    total_size,
+    src_fs,
+    src_path,
+    dst_fs,
+    dst_path,
+    bytes_written,
+    hash_object,
+):
+    # type: (...) -> int
+    offset = 0
+    while offset < len(chunk):
+        write_count = write_file.write(chunk[offset:])
+        if write_count is None:
+            write_count = len(chunk) - offset
+        if write_count <= 0:
+            raise IOError("destination stream wrote no data")
+        offset += write_count
+        bytes_written += write_count
+        hash_object.update(chunk[offset - write_count : offset])
+        _report_progress(
+            on_progress,
+            bytes_written,
+            total_size,
+            src_fs,
+            src_path,
+            dst_fs,
+            dst_path,
+        )
+    return bytes_written
+
+
+def _unique_path(fs, directory, prefix, attempted=None):
+    # type: (FS, Text, Text, Optional[Set[Text]]) -> Text
+    attempted = attempted if attempted is not None else set()  # type: Set[Text]
+    for _ in range(64):
+        suffix = binascii.hexlify(os.urandom(8)).decode("ascii")
+        base_directory = directory.rstrip("/")
+        if base_directory:
+            path = "{}/.{}.{}".format(base_directory, prefix, suffix)
+        else:
+            path = "/.{}.{}".format(prefix, suffix)
+        if path in attempted:
+            continue
+        attempted.add(path)
+        if not fs.exists(path):
+            return path
+    raise Unsupported(directory, msg="unable to allocate a temporary filename")
 
 
 def copy_fs(
@@ -229,6 +319,221 @@ def copy_file_if(
                     lock=True,
                 )
             return do_copy
+
+
+def copy_file_atomic(
+    src_fs,  # type: Union[FS, Text]
+    src_path,  # type: Text
+    dst_fs,  # type: Union[FS, Text]
+    dst_path,  # type: Text
+    on_progress=None,  # type: Optional[_OnProgress]
+    chunk_size=_COPY_CHUNK_SIZE,  # type: int
+    preserve_time=False,  # type: bool
+    allow_non_atomic=False,  # type: bool
+    hash_name="sha256",  # type: Text
+):
+    # type: (...) -> Dict[Text, Any]
+    """Copy a file to a temporary path, verify it, then publish it.
+
+    Progress is reported as the number of bytes that the destination
+    accepted, not the number of bytes read from the source. The callback
+    may return `False` to request cancellation; cancellation and other
+    exceptions remove the temporary file created by this call.
+
+    Arguments:
+        src_fs (FS or str): Source filesystem (instance or URL).
+        src_path (str): Path to a file on the source filesystem.
+        dst_fs (FS or str): Destination filesystem (instance or URL).
+        dst_path (str): Path to a file on the destination filesystem.
+        on_progress (callable, optional): Called as
+            ``on_progress(bytes_written, total_size, src_fs, src_path,
+            dst_fs, dst_path)`` before copying and after every destination
+            write. Return `False` to cancel.
+        chunk_size (int): Maximum number of bytes read at once.
+        preserve_time (bool): If `True`, copy the source modification time
+            after the destination is published.
+        allow_non_atomic (bool): If `True`, replace existing files on
+            backends that do not advertise atomic replacement using a
+            best-effort backup-and-restore fallback. If `False`, such
+            backends raise `~fs.errors.Unsupported`.
+        hash_name (str): Hash algorithm used to verify the completed
+            temporary file.
+
+    Returns:
+        dict: A dictionary containing ``bytes_written``, ``size`` and
+        ``hash``.
+
+    Raises:
+        fs.errors.IllegalDestination: If source and destination identify
+            the same file.
+        fs.errors.CopyCancelled: If ``on_progress`` returns `False`.
+        fs.errors.Unsupported: If an existing destination requires a
+            non-atomic fallback and ``allow_non_atomic`` is `False`.
+
+    """
+    with manage_fs(src_fs, writeable=False) as _src_fs:
+        with manage_fs(dst_fs, create=True, writeable=True) as _dst_fs:
+            return _copy_file_atomic_internal(
+                _src_fs,
+                src_path,
+                _dst_fs,
+                dst_path,
+                on_progress=on_progress,
+                chunk_size=chunk_size,
+                preserve_time=preserve_time,
+                allow_non_atomic=allow_non_atomic,
+                hash_name=hash_name,
+                lock=True,
+            )
+
+
+def _copy_file_atomic_internal(
+    src_fs,
+    src_path,
+    dst_fs,
+    dst_path,
+    on_progress=None,
+    chunk_size=_COPY_CHUNK_SIZE,
+    preserve_time=False,
+    allow_non_atomic=False,
+    hash_name="sha256",
+    lock=False,
+):
+    # type: (...) -> Dict[Text, Any]
+    _src_path = src_fs.validatepath(src_path)
+    _dst_path = dst_fs.validatepath(dst_path)
+    if src_fs is dst_fs and _src_path == _dst_path:
+        raise IllegalDestination(dst_path)
+
+    def _copy_locked():
+        # type: () -> Dict[Text, Any]
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+        try:
+            hashlib.new(hash_name)
+        except ValueError:
+            raise UnsupportedHash("hash '{}' is not supported".format(hash_name))
+
+        if dst_fs.isdir(_dst_path):
+            raise FileExpected(dst_path)
+        src_info = src_fs.getinfo(_src_path, ("details",))
+        if src_info.is_dir:
+            raise FileExpected(src_path)
+        total_size = src_info.size
+
+        destination_exists = dst_fs.exists(_dst_path)
+        if (
+            destination_exists
+            and not allow_non_atomic
+            and not dst_fs.getmeta().get("supports_atomic_replace", False)
+        ):
+            raise Unsupported(
+                _dst_path,
+                msg="destination filesystem does not support atomic replacement",
+            )
+
+        destination_directory = dirname(_dst_path)
+        temp_name = "{}.tmp".format(basename(_dst_path))
+        temp_path = _unique_path(dst_fs, destination_directory, temp_name)
+
+        _report_progress(
+            on_progress, 0, total_size, src_fs, src_path, dst_fs, dst_path
+        )
+
+        bytes_written = 0
+        hash_object = hashlib.new(hash_name)
+        temp_created = False
+        try:
+            with src_fs.openbin(_src_path) as read_file:
+                with dst_fs.openbin(temp_path, "x") as write_file:
+                    temp_created = True
+                    while True:
+                        chunk = read_file.read(chunk_size)
+                        if not chunk:
+                            break
+                        bytes_written = _write_all(
+                            write_file,
+                            chunk,
+                            on_progress,
+                            total_size,
+                            src_fs,
+                            src_path,
+                            dst_fs,
+                            dst_path,
+                            bytes_written,
+                            hash_object,
+                        )
+                    write_file.flush()
+
+                if dst_fs.getsize(temp_path) != bytes_written:
+                    raise ResourceInvalid(
+                        temp_path, msg="copied size verification failed"
+                    )
+
+                source_hash = _hash_file(src_fs, _src_path, hash_name)
+                temporary_hash = _hash_file(dst_fs, temp_path, hash_name)
+                written_hash = hash_object.hexdigest()
+                if source_hash != temporary_hash or source_hash != written_hash:
+                    raise ResourceInvalid(
+                        temp_path, msg="copied hash verification failed"
+                    )
+
+                backup_path = None
+                if destination_exists:
+                    if dst_fs.getmeta().get("supports_atomic_replace", False):
+                        dst_fs.replace(temp_path, _dst_path)
+                        temp_created = False
+                    else:
+                        backup_name = "{}.bak".format(basename(_dst_path))
+                        backup_path = _unique_path(
+                            dst_fs, destination_directory, backup_name
+                        )
+                        dst_fs.move(_dst_path, backup_path)
+                        try:
+                            dst_fs.move(temp_path, _dst_path)
+                            temp_created = False
+                        except Exception:
+                            try:
+                                dst_fs.move(backup_path, _dst_path)
+                            finally:
+                                if dst_fs.exists(temp_path):
+                                    dst_fs.remove(temp_path)
+                                temp_created = False
+                            raise
+                        try:
+                            dst_fs.remove(backup_path)
+                        except Exception:
+                            if not dst_fs.exists(_dst_path):
+                                raise
+                else:
+                    dst_fs.move(temp_path, _dst_path)
+                    temp_created = False
+
+                if preserve_time:
+                    src_meta = src_fs.getinfo(_src_path, ("details",))
+                    src_details = src_meta.raw.get("details", {})
+                    dst_details = {}
+                    for value in ("metadata_changed", "modified"):
+                        if value in src_details:
+                            dst_details[value] = src_details[value]
+                    if dst_details:
+                        dst_fs.setinfo(_dst_path, {"details": dst_details})
+        except Exception:
+            if temp_created and dst_fs.exists(temp_path):
+                dst_fs.remove(temp_path)
+            raise
+
+        return {
+            "bytes_written": bytes_written,
+            "size": bytes_written,
+            "hash": source_hash,
+            "hash_name": hash_name,
+        }
+
+    if lock:
+        with src_fs.lock(), dst_fs.lock():
+            return _copy_locked()
+    return _copy_locked()
 
 
 def copy_file_internal(

@@ -385,6 +385,7 @@ class FTPFS(FS):
         "invalid_path_chars": "\0",
         "network": True,
         "read_only": False,
+        "supports_atomic_replace": False,
         "thread_safe": True,
         "unicode_paths": True,
         "virtual": False,
