@@ -3,13 +3,23 @@
 
 from __future__ import print_function, unicode_literals
 
+import hashlib
 import typing
+import uuid
 
 import warnings
 
-from .errors import IllegalDestination, ResourceNotFound
+from .errors import (
+    DestinationExists,
+    FileExpected,
+    IllegalDestination,
+    OperationFailed,
+    ResourceNotFound,
+    Unsupported,
+    UnsupportedHash,
+)
 from .opener import manage_fs
-from .path import abspath, combine, frombase, isbase, normpath
+from .path import abspath, basename, combine, dirname, frombase, isbase, normpath
 from .tools import is_thread_safe
 from .walk import Walker
 
@@ -19,6 +29,20 @@ if typing.TYPE_CHECKING:
     from .base import FS
 
     _OnCopy = Callable[[FS, Text, FS, Text], object]
+
+    _OnProgress = Callable[[int, int], object]
+
+
+class CopyCancelled(OperationFailed):
+    """The copy was cancelled by the progress callback."""
+
+    default_message = "copy cancelled"
+
+
+class CopyVerificationFailed(OperationFailed):
+    """The copied data did not verify against the source."""
+
+    default_message = "copied data failed verification"
 
 
 def copy_fs(
@@ -283,6 +307,169 @@ def copy_file_internal(
             _copy_locked()
     else:
         _copy_locked()
+
+
+def copy_file_atomic(
+    src_fs,  # type: Union[FS, Text]
+    src_path,  # type: Text
+    dst_fs,  # type: Union[FS, Text]
+    dst_path,  # type: Text
+    progress=None,  # type: Optional[_OnProgress]
+    chunk_size=None,  # type: Optional[int]
+    hash_name="sha256",  # type: Text
+    overwrite=True,  # type: bool
+    allow_non_atomic=False,  # type: bool
+):
+    # type: (...) -> int
+    """Copy a file to a temporary file on the destination, then publish it.
+
+    The data is first streamed to a uniquely named temporary file in the
+    same directory as ``dst_path``. Once every byte has been written and
+    the temporary file verifies against the source, it is moved over
+    ``dst_path``. A pre-existing destination file is therefore left
+    untouched until the copy has completed successfully, and any failure
+    (including cancellation) removes only the temporary file created by
+    this call.
+
+    Arguments:
+        src_fs (FS or str): Source filesystem (instance or URL).
+        src_path (str): Path to a file on the source filesystem.
+        dst_fs (FS or str): Destination filesystem (instance or URL).
+        dst_path (str): Path to a file on the destination filesystem.
+        progress (callable, optional): Called as ``progress(written,
+            total)`` after bytes have been written to the destination,
+            where ``written`` is the number of bytes actually written so
+            far and ``total`` is the size of the source file. Return
+            ``False`` to cancel the copy, which raises
+            `~fs.copy.CopyCancelled`. Exceptions raised by the callback
+            propagate after the same cleanup as any other failure.
+        chunk_size (int, optional): Number of bytes to copy at a time
+            (defaults to 1MB).
+        hash_name (str): Name of the `hashlib` algorithm used to verify
+            the temporary file against the source (defaults to
+            ``"sha256"``).
+        overwrite (bool): If `True` (default), an existing destination
+            file is replaced when the copy is published. If `False` and
+            ``dst_path`` exists, `~fs.errors.DestinationExists` is raised
+            before any data is copied.
+        allow_non_atomic (bool): Permit publishing on filesystems that
+            do not report ``supports_rename`` in their meta. On such
+            backends the final move degrades to a copy followed by a
+            remove, so replacing an existing destination is *not*
+            atomic. Defaults to `False`, which refuses the copy with
+            `~fs.errors.Unsupported`.
+
+    Returns:
+        int: The number of bytes written and published.
+
+    Raises:
+        fs.errors.IllegalDestination: If source and destination are the
+            same file.
+        fs.errors.FileExpected: If ``dst_path`` is a directory.
+        fs.errors.DestinationExists: If ``dst_path`` exists and
+            ``overwrite`` is `False`.
+        fs.errors.Unsupported: If the destination filesystem cannot
+            replace files atomically and ``allow_non_atomic`` is `False`.
+        fs.errors.UnsupportedHash: If ``hash_name`` is not supported.
+        fs.copy.CopyCancelled: If the ``progress`` callback requests
+            cancellation.
+        fs.copy.CopyVerificationFailed: If the temporary file does not
+            match the source after copying.
+
+    """
+    with manage_fs(src_fs, writeable=False) as _src_fs:
+        with manage_fs(dst_fs, create=True) as _dst_fs:
+            _src_path = _src_fs.validatepath(src_path)
+            _dst_path = _dst_fs.validatepath(dst_path)
+
+            if _src_fs is _dst_fs and _src_path == _dst_path:
+                raise IllegalDestination(dst_path)
+            if _dst_fs.isdir(_dst_path):
+                raise FileExpected(dst_path)
+            if not overwrite and _dst_fs.exists(_dst_path):
+                raise DestinationExists(dst_path)
+            if not allow_non_atomic and not _dst_fs.getmeta().get(
+                "supports_rename", False
+            ):
+                raise Unsupported(
+                    dst_path,
+                    msg="destination filesystem does not support atomic "
+                    "rename; pass allow_non_atomic=True to publish "
+                    "non-atomically",
+                )
+            try:
+                hash_object = hashlib.new(hash_name)
+            except ValueError:
+                raise UnsupportedHash(
+                    "hash '{}' is not supported".format(hash_name)
+                )
+
+            total = _src_fs.getsize(_src_path)
+            _chunk_size = 1024 * 1024 if chunk_size is None else chunk_size
+
+            _dst_dir = dirname(_dst_path)
+            _dst_name = basename(_dst_path)
+            temp_path = None
+            for _ in range(100):
+                candidate = combine(
+                    _dst_dir, ".{}.{}.tmp".format(_dst_name, uuid.uuid4().hex)
+                )
+                if not _dst_fs.exists(candidate):
+                    temp_path = candidate
+                    break
+            if temp_path is None:
+                raise OperationFailed(
+                    dst_path, msg="unable to allocate a temporary path"
+                )
+
+            written = 0
+            published = False
+            try:
+                with _src_fs.openbin(_src_path) as read_file:
+                    with _dst_fs.openbin(temp_path, "w") as write_file:
+                        write = write_file.write
+                        while True:
+                            chunk = read_file.read(_chunk_size)
+                            if not chunk:
+                                break
+                            hash_object.update(chunk)
+                            offset = 0
+                            while offset < len(chunk):
+                                num_written = write(chunk[offset:])
+                                if num_written is None:
+                                    num_written = len(chunk) - offset
+                                if num_written <= 0:
+                                    raise OperationFailed(
+                                        dst_path,
+                                        msg="destination write made no progress",
+                                    )
+                                offset += num_written
+                                written += num_written
+                                if (
+                                    progress is not None
+                                    and progress(written, total) is False
+                                ):
+                                    raise CopyCancelled(
+                                        dst_path,
+                                        msg="copy cancelled by progress callback",
+                                    )
+
+                if _dst_fs.hash(temp_path, hash_name) != hash_object.hexdigest():
+                    raise CopyVerificationFailed(
+                        dst_path,
+                        msg="hash of temporary file does not match source",
+                    )
+
+                _dst_fs.move(temp_path, _dst_path, overwrite=True)
+                published = True
+            finally:
+                if not published:
+                    try:
+                        _dst_fs.remove(temp_path)
+                    except ResourceNotFound:
+                        pass
+
+            return written
 
 
 def copy_structure(
