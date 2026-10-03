@@ -77,6 +77,28 @@ def cache_directory(fs):
     return WrapCachedDir(fs)
 
 
+def limit_capabilities(fs, capabilities, close_wrap=False):
+    # type: (_T, typing.Iterable[typing.Text], bool) -> typing.Any
+    """Restrict a filesystem to a set of capabilities.
+
+    This is a thin convenience wrapper around
+    `~fs.capabilityfs.Capability`.
+
+    Arguments:
+        fs (FS): A filesystem instance owned by the caller.
+        capabilities (iterable[str]): Capability tokens to grant; all
+            other operations raise `~fs.errors.PermissionDenied`.
+        close_wrap (bool): If `True`, closing the returned wrapper also
+            closes ``fs`` (defaults to `False`).
+
+    Returns:
+        ~fs.capabilityfs.CapabilityFS: the restricted filesystem.
+    """
+    from .capabilityfs import CapabilityFS
+
+    return CapabilityFS(fs, capabilities, close_wrap=close_wrap)
+
+
 class WrapCachedDir(WrapFS[_F], typing.Generic[_F]):
     """Caches filesystem directory information.
 

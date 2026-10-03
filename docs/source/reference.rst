@@ -23,4 +23,5 @@ Reference
    reference/walk.rst
    reference/wildcard.rst
    reference/wrap.rst
+   reference/capabilityfs.rst
    reference/wrapfs.rst
