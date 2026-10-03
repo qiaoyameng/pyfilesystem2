@@ -5,6 +5,7 @@ Reference
    :maxdepth: 3
 
    reference/base.rst
+   reference/capabilityfs.rst
    reference/compress.rst
    reference/copy.rst
    reference/enums.rst
